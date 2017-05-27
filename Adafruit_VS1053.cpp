@@ -12,7 +12,7 @@
   BSD license, all text above must be included in any redistribution
  ****************************************************/
 
-#include <Adafruit_VS1053.h>
+#include "Adafruit_VS1053.h"
 #include <SD.h>
 
 #if defined(ARDUINO_STM32_FEATHER)
@@ -144,8 +144,22 @@ boolean Adafruit_VS1053_FilePlayer::playFullFile(const char *trackname) {
 }
 
 void Adafruit_VS1053_FilePlayer::stopPlaying(void) {
-  // cancel all playback
-  sciWrite(VS1053_REG_MODE, VS1053_MODE_SM_LINE1 | VS1053_MODE_SM_SDINEW | VS1053_MODE_SM_CANCEL);
+  boolean wasReset = false;
+  if (playingMusic) {
+    // cancel all playback.
+    if (!doCancel()) {
+      softReset();
+      wasReset = true;
+    } else {
+      // Spec says flush cancel with 2052 (weird number) bytes.
+      sendEndFillByte(2052);
+    }
+  }
+
+  // Assume cancel is done. Put VS1053 back into known state.
+  if (!wasReset) {
+    sciWrite(VS1053_REG_MODE, VS1053_MODE_SM_LINE1 | VS1053_MODE_SM_SDINEW);
+  }
   
   // wrap it up!
   playingMusic = false;
@@ -242,6 +256,13 @@ void Adafruit_VS1053_FilePlayer::feedBuffer_noLock(void) {
     
     if (bytesread == 0) {
       // must be at the end of the file, wrap it up!
+      //
+      // Per 9.5.1, send end fill bytes. Cancel. Then send more until cancel
+      // registers.
+      sendEndFillByte(2052);
+      if (!doCancel()) {
+        softReset();
+      }
       playingMusic = false;
       currentTrack.close();
       break;
@@ -251,6 +272,87 @@ void Adafruit_VS1053_FilePlayer::feedBuffer_noLock(void) {
   }
 }
 
+boolean Adafruit_VS1053_FilePlayer::blockUntilReadyForData(long abortAtMillis) {
+  while (!readyForData()) {
+    if (millis() > abortAtMillis) {
+      return false;
+    }
+  }
+  return true;
+}
+
+boolean Adafruit_VS1053_FilePlayer::sendEndFillByte(int numBytes) {
+  uint8_t endFillByte = (uint8_t)sciRead(VS1053_PARAM_ENDFILLBYTE);
+  uint8_t buf[VS1053_DATABUFFERLEN];
+  memset(buf, endFillByte, sizeof(buf));
+
+  int bytes_sent = 0;
+  long abortAtMillis = millis() + 1000;
+  for (int i = 0; i < numBytes/VS1053_DATABUFFERLEN; i++) {
+    if (!blockUntilReadyForData(abortAtMillis)) {
+      return false;
+    }
+    playData(buf, sizeof(buf));
+    bytes_sent += sizeof(buf);
+  }
+  if (!blockUntilReadyForData(abortAtMillis)) {
+    return false;
+  }
+  playData(buf, numBytes - bytes_sent);
+  return true;
+}
+
+boolean Adafruit_VS1053_FilePlayer::doCancel() {
+  // Per 9.5.2, canceling playback requires sending a bunch of endFillByte
+  // and polling SM_CANCEL.
+
+  uint16_t mode = sciRead(VS1053_REG_MODE);
+  mode |= VS1053_MODE_SM_CANCEL;
+  sciWrite(VS1053_REG_MODE, mode);
+  unsigned long abortAtMillis = millis() + 1000;
+  boolean isCancelDone = false;
+
+  // Spec says to send up to 2048 bytes of data while watiing for cancel to
+  // complete.
+  for (int i = 0;
+      i < 2048/VS1053_DATABUFFERLEN && !isCancelDone;
+      i++) {
+    // Taking more than 1 second to cancel means the chip has hung.
+    // Just reset.
+    if (millis() > abortAtMillis) {
+      return false;
+    }
+
+    if (!blockUntilReadyForData(abortAtMillis)) {
+      return false;
+    }
+
+    // Write on buffer of data and see if cancel has completed.
+    int bytesread = currentTrack.read(mp3buffer, VS1053_DATABUFFERLEN);
+
+    // Write the data and see if cancel has finished.
+    if (bytesread) {
+      playData(mp3buffer, bytesread);
+    } else {
+      // Oh noes. Our file completed mid-way through cancel. No provision for
+      // this is given in the docs. Best guess is to conintue filling with
+      // endFillByte.
+      //
+      // This is horridly inefficient. It rereads endfillbyte each call.
+      // However, it's also a really rare path, so good enough.
+      sendEndFillByte(VS1053_DATABUFFERLEN);
+    }
+
+    isCancelDone = (sciRead(VS1053_REG_MODE) & VS1053_MODE_SM_CANCEL) == 0;
+  }
+
+  // Too many samples have been sent w/o VS1053 finishing cancel. Bail.
+  if (!isCancelDone) {
+    return false;
+  }
+
+  return true;
+}
 
 /***************************************************************/
 
@@ -583,7 +685,7 @@ boolean Adafruit_VS1053::GPIO_digitalRead(uint8_t i) {
   return false;
 }
 
-uint16_t Adafruit_VS1053::sciRead(uint8_t addr) {
+uint16_t Adafruit_VS1053::sciRead(uint16_t addr) {
   uint16_t data;
 
   #ifdef SPI_HAS_TRANSACTION
@@ -605,7 +707,7 @@ uint16_t Adafruit_VS1053::sciRead(uint8_t addr) {
 }
 
 
-void Adafruit_VS1053::sciWrite(uint8_t addr, uint16_t data) {
+void Adafruit_VS1053::sciWrite(uint16_t addr, uint16_t data) {
   #ifdef SPI_HAS_TRANSACTION
   if (useHardwareSPI) SPI.beginTransaction(VS1053_CONTROL_SPI_SETTING);
   #endif

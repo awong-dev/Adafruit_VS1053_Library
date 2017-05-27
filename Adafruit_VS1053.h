@@ -100,6 +100,8 @@ typedef volatile RwReg PortReg;
 #define VS1053_SCI_AICTRL2 0x0E
 #define VS1053_SCI_AICTRL3 0x0F
 
+#define VS1053_PARAM_ENDFILLBYTE 0x1E06
+
 #define VS1053_DATABUFFERLEN 32
 
 
@@ -111,8 +113,8 @@ class Adafruit_VS1053 {
   uint8_t begin(void);
   void reset(void);
   void softReset(void);
-  uint16_t sciRead(uint8_t addr);
-  void sciWrite(uint8_t addr, uint16_t data);
+  uint16_t sciRead(uint16_t addr);
+  void sciWrite(uint16_t addr, uint16_t data);
   void sineTest(uint8_t n, uint16_t ms);
   void spiwrite(uint8_t d);
   void spiwrite(uint8_t *c, uint16_t num); 
@@ -181,6 +183,9 @@ class Adafruit_VS1053_FilePlayer : public Adafruit_VS1053 {
 
  private:
   void feedBuffer_noLock(void);
+  boolean blockUntilReadyForData(long abortMillis);
+  boolean sendEndFillByte(int numBytes);
+  boolean doCancel();
 
   uint8_t _cardCS;
 };
